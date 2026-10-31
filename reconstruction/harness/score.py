@@ -61,19 +61,67 @@ def candidate_functions(path):
     return funcs
 
 
+# Content hashes for the window inputs, reused only while that path's size and
+# mtime_ns are unchanged. The on-disk stamp is still those content hashes.
+_INPUT_DIGESTS = {}
+
+
+def file_digest(path):
+    """SHA-256 digest of `path`, memoized by path, size and mtime_ns."""
+    path = Path(path)
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    found = _INPUT_DIGESTS.get(key)
+    if found is not None:
+        return found
+    digest = hashlib.sha256(path.read_bytes()).digest()
+    for old in [item for item in _INPUT_DIGESTS if item[0] == key[0] and item != key]:
+        del _INPUT_DIGESTS[old]
+    _INPUT_DIGESTS[key] = digest
+    return digest
+
+
+def window_cache_stamp():
+    """Content-hash identity of the two files the cached window bodies come from."""
+    digest = hashlib.sha256()
+    for name in ('original.so', 'functions.tsv'):
+        digest.update(file_digest(BASE / name))
+    return digest.hexdigest()
+
+
 def original_windows():
+    """Selected Pump windows from the captured program and functions.tsv.
+
+    The local pickle is only a speed cache. It is reused when its content-hash
+    stamp matches those two files, and rebuilt when the stamp is missing,
+    different, or loading the pickle fails. Match masking is unchanged.
+    """
     cache = BASE / 'original-windows.pkl'
-    if cache.exists():
-        return pickle.loads(cache.read_bytes())
+    stamp_path = BASE / 'original-windows.stamp'
+    stamp = window_cache_stamp()
+    if cache.is_file() and stamp_path.is_file() and stamp_path.read_text().strip() == stamp:
+        try:
+            rows = pickle.loads(cache.read_bytes())
+        except Exception:
+            # AttributeError, ImportError, IndexError, UnpicklingError and other
+            # Exception subclasses are cache misses. KeyboardInterrupt and
+            # SystemExit inherit from BaseException and still propagate.
+            rows = None
+        if isinstance(rows, list):
+            return rows
     orig = (BASE / 'original.so').read_bytes(); os_ = sections(orig)
     rows = []
-    for r in csv.DictReader((BASE / 'functions.tsv').open(), delimiter='\t'):
-        if r['program'] != 'pump' or r['variant'] != 'selected':
-            continue
-        s, e = int(r['original_start']), int(r['original_end'])
-        raw = body(orig, os_, s, e - s)
-        rows.append({'start': s, 'bytes': e - s, 'raw': raw, 'norm': normalize(raw, s, os_)})
-    cache.write_bytes(pickle.dumps(rows))
+    with (BASE / 'functions.tsv').open(newline='') as handle:
+        for r in csv.DictReader(handle, delimiter='\t'):
+            if r['program'] != 'pump' or r['variant'] != 'selected':
+                continue
+            s, e = int(r['original_start']), int(r['original_end'])
+            raw = body(orig, os_, s, e - s)
+            rows.append({'start': s, 'bytes': e - s, 'raw': raw, 'norm': normalize(raw, s, os_)})
+    temporary = cache.with_name('original-windows.pkl.tmp')
+    temporary.write_bytes(pickle.dumps(rows))
+    temporary.replace(cache)
+    stamp_path.write_text(stamp + '\n')
     return rows
 
 
